@@ -6,8 +6,9 @@ mod http;
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let g1 = tokio::spawn(async {
-        let url = "fxg.jinritemai.com:80";
-        let content = http::Request::new(&url, http::RequestMethod::GET)
+        let url = "http://avalon.bytedance.net/web/measure/project_score:80";
+        let mut request = http::Request::new(&url, http::RequestMethod::GET);
+        let content = request
             .add_header("Connction", "Close")
             .add_header("Host", "fxg.jinritemai.com")
             .add_header("Accept-Encoding", "gzip, deflate, br")
@@ -17,8 +18,9 @@ async fn main() -> std::io::Result<()> {
             .add_header("Sec-Fetch-Dest", "document")
             .get_content(url)
             .await;
-        if let Ok(content) = content {
-            println!("{url}:\n{}", content);
+        match content {
+            Ok(content) => println!("{url}:\n{}", content.to_string()),
+            Err(err) => println!("{}", err),
         }
     });
 

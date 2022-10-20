@@ -1,28 +1,33 @@
-use std::{collections::HashMap, time};
+use std::{collections::HashMap, str::FromStr, time, vec, fmt::format};
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{self, ToSocketAddrs},
 };
 
 use url_parse::core::Parser;
 
+use super::Response;
 use crate::error;
 
+#[derive(Default)]
 pub enum RequestMethod {
+    #[default]
     GET,
 
     #[allow(dead_code)]
     POST,
 }
 
+#[derive(Default)]
 pub struct Request<'a> {
-    pub url: &'a str,
-    pub consume_time: time::Duration,
-    pub result: String,
-    pub header: HashMap<String, String>,
-    pub method: RequestMethod,
-    pub body: String,
+    url: &'a str,
+    consume_time: time::Duration,
+    result: Response,
+    header: HashMap<String, String>,
+    method: RequestMethod,
+    body: String,
+    header_length: usize,
 }
 
 impl<'a> Request<'a> {
@@ -30,54 +35,70 @@ impl<'a> Request<'a> {
         Self {
             url: url,
             method: method,
-            consume_time: Default::default(),
-            result: Default::default(),
-            header: Default::default(),
-            body: Default::default(),
+            ..Default::default()
         }
     }
 
     pub fn add_header<T: Into<String>>(&mut self, key: T, val: T) -> &mut Self {
-        self.header.insert(key.into().to_lowercase(), val.into());
+        let key: String = key.into().to_lowercase();
+        let val: String = val.into();
+        self.header_length += key.len() + 2 + val.len() + 2;
+        self.header.insert(key, val);
         self
     }
 
     #[allow(dead_code)]
-    pub fn add_body(&mut self, value: String) -> &mut Self {
+    pub fn remove_header(&mut self, key: String) -> &mut Self {
+        match self.header.remove(&key) {
+            Some(value) => self.header_length -= key.len() - 2 - value.len() - 2,
+            None => (),
+        };
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn set_body(&mut self, value: String) -> &mut Self {
         self.body = value;
         self
     }
 
-    pub async fn get_content<T>(&mut self, url: T) -> Result<String, Box<dyn std::error::Error>>
+    pub async fn get_content<'b, T>(
+        &'b mut self,
+        _url: T,  //for now, this is useless
+    ) -> Result<&'b Response, Box<dyn std::error::Error>>
     where
         T: ToSocketAddrs + AsRef<str>,
     {
         let start_time = time::SystemTime::now();
-        let addr = net::lookup_host(&url)
+
+        let url = match Parser::new(None).parse(self.url) {
+            Ok(url) => url,
+            Err(_) => return Err(Box::new(error::RequestError::ParseUrlError)),
+        };
+        let path = match (&url.subdomain, &url.domain, &url.top_level_domain, &url.port) {
+            (Some(subdomain), Some(domain), Some(top_level_domain), Some(port)) => format!("{}.{}.{}:{}", subdomain, domain, top_level_domain, port),
+            _ => return Err(Box::new(error::RequestError::ParseUrlError)),
+        };
+
+        let addr = net::lookup_host(&path)
             .await?
             .filter(|p| p.is_ipv4())
             .take(1)
             .last()
-            .expect(format!("failed to find any IP address with {}", url.as_ref()).as_str());
+            .expect(format!("failed to find any IP address with {}", path).as_str());
         let sock = net::TcpSocket::new_v4()?;
+
         let mut sock = sock.connect(addr).await?;
 
-        let mut length_of_header = 0;
-        self.header
-            .iter()
-            .for_each(|x| length_of_header += x.0.len() + x.1.len() + 4);
-        let mut s_content = String::with_capacity(20 + length_of_header + self.body.len());
+        let mut s_content = String::with_capacity(20 + self.header_length + self.body.len());
         match self.method {
             RequestMethod::GET => s_content.push_str("GET "),
             RequestMethod::POST => s_content.push_str("POST "),
         }
 
-        let mut path = match Parser::new(None).parse(self.url) {
-            Ok(url) => match url.path {
-                Some(val) => val.join("/"),
-                _ => "/".to_string(),
-            },
-            Err(_) => return Err(Box::new(error::RequestError::ParseUrlError)),
+        let mut path = match url.path {
+            Some(val) => val.join("/"),
+            _ => "/".to_string(),
         };
         if path == "" {
             path.push_str("/");
@@ -99,19 +120,40 @@ impl<'a> Request<'a> {
         sock.write(s_content.as_bytes()).await?;
 
         let mut reader = BufReader::new(sock);
-        let header = self.get_response_header(&mut reader).await?;
+        self.parse_response_first_line(&mut reader).await?;
+        self.parse_response_header(&mut reader).await?;
+        self.parse_response_body(&mut reader).await?;
         if let Ok(time) = start_time.elapsed() {
             self.consume_time = time;
         }
 
-        Ok(header)
+        Ok(&self.result)
     }
 
-    async fn get_response_header(
-        &self,
+    async fn parse_response_first_line(
+        &mut self,
         reader: &mut BufReader<tokio::net::TcpStream>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let mut result = String::new();
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buf = String::new();
+        reader.read_line(&mut buf).await?;
+        let pieces = buf
+            .split_ascii_whitespace()
+            .map(|x| x.trim())
+            .collect::<Vec<&str>>();
+        if pieces.len() < 3 {
+            return Err(Box::new(error::RequestError::ParseHeaderError(buf)));
+        }
+        self.result.set_http_version(pieces[0]);
+        self.result.set_status_code(pieces[1]);
+        self.result.set_reason(pieces[2]);
+
+        Ok(())
+    }
+
+    async fn parse_response_header(
+        &mut self,
+        reader: &mut BufReader<tokio::net::TcpStream>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let mut buf = Vec::<u8>::new();
             if let Ok(num) = reader.read_until(b'\n', &mut buf).await {
@@ -119,8 +161,28 @@ impl<'a> Request<'a> {
                     break;
                 }
             }
-            result.push_str(String::from_utf8(buf)?.as_str())
+            let header = String::from_utf8(buf)?;
+            match header.split_once(":") {
+                Some((k, v)) => self.result.add_header(
+                    String::from_str(k)?.trim(),
+                    String::from_str(v)?.trim_start(),
+                ),
+                None => return Err(Box::new(error::RequestError::ParseHeaderError(header))),
+            };
         }
-        Ok(result)
+        Ok(())
+    }
+
+    async fn parse_response_body(
+        &mut self,
+        reader: &mut BufReader<tokio::net::TcpStream>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.result.get_content_length() == 0 {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; self.result.get_content_length()];
+        reader.read_exact(&mut buf).await?;
+        self.result.set_body(String::from_utf8(buf)?);
+        Ok(())
     }
 }
